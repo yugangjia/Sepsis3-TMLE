@@ -1,0 +1,187 @@
+---
+title: "tmle_sepsis"
+author: "yirencao"
+date: '2022-07-04'
+output: html_document
+---
+
+```{r}
+# data cleanup
+require(dplyr)
+library("tmle")
+library("psych")
+raw_data <- read.csv("/Volumes/Disk199G/mph/Team-Sepsis/Raw Data.csv", header=TRUE, stringsAsFactors=TRUE)
+sepsis_data <- raw_data %>%
+      mutate(gender = ifelse(gender == "F",1,0))
+ventilation_bin <- raw_data[, c(1)] # just copy any column and will put them into the raw_data, and will modify it as necessary below
+death_bin <- raw_data[, c(1)]
+ethnicity_white <- raw_data[, c(1)]
+sepsis_data <- cbind(sepsis_data, ventilation_bin, death_bin, ethnicity_white)
+sepsis_data <- sepsis_data %>% mutate(ventilation_bin = ifelse(InvasiveVent_hr > 0 & !is.na(InvasiveVent_hr), 1, 0))
+sepsis_data <- sepsis_data %>% mutate(death_bin = ifelse(discharge_location == "DIED" | discharge_location == "HOSPICE" , 
+                                                         1, 
+                                                         ifelse(discharge_location == "", NaN, 0)))
+sepsis_data <- sepsis_data %>% mutate(ethnicity_white = ifelse(ethnicity == "WHITE", 1, 0))
+
+sepsis_data <- sepsis_data %>% mutate(charlson_comorbidity_index = ifelse(
+  charlson_comorbidity_index >= 0 & charlson_comorbidity_index <= 5, "0 - 5",
+  ifelse(
+  charlson_comorbidity_index >= 6 & charlson_comorbidity_index <= 10, "6 - 10",
+  ifelse(
+  charlson_comorbidity_index >= 11 & charlson_comorbidity_index <= 15, "11 - 15",
+  "16 and above")
+  )
+))
+
+# in raw_data, pressor is either True or "", map it to 1 or 0 
+sepsis_data <- sepsis_data %>% mutate(pressor = ifelse(pressor == levels(raw_data$pressor)[2], 1, 0))
+
+sepsis_data <- sepsis_data %>% mutate(rrt = ifelse(is.na(rrt), 0, 1))
+
+```
+
+```{r}
+# Causal analysis for mortality ~ ventilation
+```
+
+```{r}
+# Data stratification
+# by SOFA & year group: define a function to extract data only that meet selected SOFA & anchor year group:
+#            1, sofa_low_inclusive <= SOFA <= sofa_high_inclusive
+#            2, anchor_year_group == ayg_value
+data_between_sofa_and_anchor_year_group <- function(
+    sofa_low_inclusive, sofa_high_inclusive,
+    ayg_value) {
+  res <- sepsis_data[sepsis_data$SOFA <= sofa_high_inclusive & sepsis_data$SOFA >= sofa_low_inclusive & sepsis_data$anchor_year_group == ayg_value, c("anchor_age","gender","ethnicity_white","SOFA","charlson_comorbidity_index", "ventilation_bin", "death_bin", "rrt", "pressor")]
+  return(na.omit(res))
+}
+
+# by SOFA only, define a function to extract data only that meet selected SOFA group
+data_between_sofa_with_rrt_pressor <- function(
+    sofa_low_inclusive, sofa_high_inclusive) {
+  res <- sepsis_data[sepsis_data$SOFA <= sofa_high_inclusive & sepsis_data$SOFA >= sofa_low_inclusive, c("anchor_age","gender","ethnicity_white","SOFA","charlson_comorbidity_index","anchor_year_group", "ventilation_bin", "death_bin", "rrt", "pressor")]
+  return(na.omit(res))
+}
+
+```
+
+```{r}
+# Run TMLE function
+# by SOFA & year group
+require(arm)
+require(earth)
+require(ranger)
+require(rpart)
+require(xgboost)
+library(hal9001)
+library(haldensify)
+library(biglasso)
+run_tmle_sofa_ayg <- function(sofa_low_inclusive, sofa_high_inclusive, ayg_value) {
+  # TMLE 
+  print(paste0('Ventilation effect for SOFA between [', sofa_low_inclusive, ",", sofa_high_inclusive,"] with anchor_year_group = ", ayg_value))
+  data_sofa = data_between_sofa_and_anchor_year_group(sofa_low_inclusive, sofa_high_inclusive, ayg_value)
+  W <- data_sofa[, c("anchor_age","gender","ethnicity_white","SOFA","charlson_comorbidity_index","rrt", "pressor")]
+  A <- data_sofa$ventilation_bin
+  Y <- data_sofa$death_bin
+  result <- tmle(Y, A, W , family = "binomial", 
+                 g.SL.library = c("SL.glm", "SL.glmnet", "SL.bayesglm","SL.mean"),
+                 Q.SL.library = c("SL.glm", "SL.glmnet", "SL.stepAIC","SL.mean","SL.earth","SL.ranger","SL.gam",
+                  "SL.bayesglm","SL.glm.interaction", "SL.biglasso")
+                 )
+  data_result <- list("data" = data_sofa, "result" = result)
+  return(data_result)
+}
+
+# by SOFA only
+run_tmle_sofa_with_rtt_pressor <- function(sofa_low_inclusive, sofa_high_inclusive) {
+  # TMLE 
+  data_sofa = data_between_sofa_with_rrt_pressor(sofa_low_inclusive, sofa_high_inclusive)
+  print(paste0('Ventilation effect for SOFA between [', sofa_low_inclusive, ",", sofa_high_inclusive,"], nrow = ", nrow(data_sofa)))
+  W <- data_sofa[, c("anchor_age","gender","ethnicity_white","SOFA","charlson_comorbidity_index","anchor_year_group", "rrt", "pressor")]
+  A <- data_sofa$ventilation_bin
+  Y <- data_sofa$death_bin
+  result <- tmle(Y, A, W , family = "binomial", 
+                 g.SL.library = c("SL.glm", "SL.glmnet", "SL.bayesglm","SL.mean"),
+                 Q.SL.library = c("SL.glm", "SL.glmnet", "SL.stepAIC","SL.mean","SL.earth","SL.ranger","SL.gam",
+                  "SL.bayesglm","SL.glm.interaction", "SL.biglasso"))
+  data_result <- list("data" = data_sofa, "result" = result)
+  return(data_result)
+}
+
+
+```
+
+```{r}
+# call TMLE function 
+# by SOFA & year group, call TMLE function
+sofa_ranges <- list(list(0, 5), list(6,10), list(11, 15), list(16, 100))
+anchor_year_groups <- list("2008 - 2010", "2011 - 2013", "2014 - 2016", "2017 - 2019")
+results <- list()
+for (sofa in sofa_ranges) {
+    start <- sofa[1]
+    end <- sofa[2]
+    for(ayg in anchor_year_groups) {
+      data_sofa_ayg = data_between_sofa_and_anchor_year_group(start, end, ayg)
+      print(paste0("Working on sofa: [", start, ",", end, "]; anchor_year_group: ", ayg, " total count:", nrow(data_sofa_ayg)))
+      input = paste0("Sofa: [", start, ",", end, "]; anchor_year_group: ", ayg, " total count:", nrow(data_sofa_ayg))
+      result = run_tmle_sofa_ayg(start, end, ayg)
+      
+      
+      print(paste0(
+        paste0("Sofa: [", start, ",", end, "]; anchor_year_group: ", ayg, ":  ")
+        ,result$result$estimates$ATE[c("psi", "CI")]))
+      results <- append(results, input)
+      results <- append(results, result)
+    }
+}
+
+# by SOFA only, call TMLE function
+sofa_ranges <- list(list(0, 5), list(6,10), list(11, 15), list(16, 100))
+results_by_sofa <- list()
+for (sofa in sofa_ranges) {
+    start <- sofa[1]
+    end <- sofa[2]
+    data_sofa_ayg = data_between_sofa_with_rrt_pressor(start, end)
+    input = paste0("V3 Working on sofa: [", start, ",", end, "]; Total count:", nrow(data_sofa_ayg))
+    print(input)
+    result = run_tmle_sofa_with_rtt_pressor(start, end)
+    print(paste0(paste0("Sofa: [", start, ",", end, "]: "),result$result$estimates$ATE[c("psi", "CI")]))
+    results_by_sofa <- append(results_by_sofa, input)
+    results_by_sofa <- append(results_by_sofa, result)
+    
+}
+
+```
+
+```{r}
+# Graphic output
+require(ggplot2)
+sofaIndex <- 1
+sofa_ranges <- c(c(0, 5), c(6,10), c(11, 15), c(16, 100))
+while (sofaIndex <= 4) {
+  aygIndex <- 1
+  F <- runif(4,1,2) 
+  L <- runif(4,0,1)
+  U <- runif(4,2,3)
+
+  while (aygIndex <= 4) {
+    infoIndex <- (sofaIndex - 1) * 12 +  (aygIndex - 1) * 3 + 1
+    dataIndex <- infoIndex + 1
+    resultIndex <- infoIndex + 2
+    ciLow <- results[resultIndex]$result$estimates$ATE$CI[1]
+    ciHigh <- results[resultIndex]$result$estimates$ATE$CI[2]
+    psi <- results[resultIndex]$result$estimates$ATE$psi[1]
+    
+    F[aygIndex] = psi
+    L[aygIndex] = ciLow
+    U[aygIndex] = ciHigh
+    aygIndex <- aygIndex + 1
+  }
+  title <- paste0("Sofa:[",sofa_ranges[sofaIndex * 2 - 1], ",", sofa_ranges[sofaIndex * 2],"]")
+  df <- data.frame(x = c("2008 - 2010", "2011 - 2013", "2014 - 2016", "2017 - 2019"), F = F, L = L, U = U)
+  p <- ggplot(df, aes(x = x, y = F)) + geom_point(size = 4) + geom_errorbar(aes(ymax = U, ymin = L)) + labs(title=title) + labs(x = "anchor_year_group", y = "ATE") + geom_hline(aes(yintercept = 0, color="red"))
+  show(p)
+  sofaIndex <- sofaIndex + 1
+  
+}
+```

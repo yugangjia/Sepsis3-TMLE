@@ -1,0 +1,295 @@
+---
+title: "tmle_sepsis"
+author: "yirencao"
+date: '2022-07-04'
+output: html_document
+---
+
+```{r}
+# data cleanup
+require(dplyr)
+library("tmle")
+library("psych")
+raw_data <- read.csv("/Volumes/Disk199G/mph/Team-Sepsis/Raw Data.csv", header=TRUE, stringsAsFactors=TRUE)
+sepsis_data <- raw_data %>%
+      mutate(gender = ifelse(gender == "F",1,0))
+ventilation_bin <- raw_data[, c(1)] # just copy any column and will put them into the raw_data, and will modify it as necessary below
+death_bin <- raw_data[, c(1)]
+ethnicity_white <- raw_data[, c(1)]
+sepsis_data <- cbind(sepsis_data, ventilation_bin, death_bin, ethnicity_white)
+sepsis_data <- sepsis_data %>% mutate(ventilation_bin = ifelse(InvasiveVent_hr > 0 & !is.na(InvasiveVent_hr), 1, 0))
+sepsis_data <- sepsis_data %>% mutate(death_bin = ifelse(discharge_location == "DIED" | discharge_location == "HOSPICE" , 
+                                                         1, 
+                                                         ifelse(discharge_location == "", NaN, 0)))
+sepsis_data <- sepsis_data %>% mutate(ethnicity_white = ifelse(ethnicity == "WHITE", 1, 0))
+
+sepsis_data <- sepsis_data %>% mutate(charlson_comorbidity_index = ifelse(
+  charlson_comorbidity_index >= 0 & charlson_comorbidity_index <= 5, "0 - 5",
+  ifelse(
+  charlson_comorbidity_index >= 6 & charlson_comorbidity_index <= 10, "6 - 10",
+  ifelse(
+  charlson_comorbidity_index >= 11 & charlson_comorbidity_index <= 15, "11 - 15",
+  "16 and above")
+  )
+))
+
+# in raw_data, pressor is either True or "", map it to 1 or 0 
+sepsis_data <- sepsis_data %>% mutate(pressor = ifelse(pressor == levels(raw_data$pressor)[2], 1, 0))
+
+sepsis_data <- sepsis_data %>% mutate(rrt = ifelse(is.na(rrt), 0, 1))
+
+```
+
+
+```{r}
+# Data stratification
+# by SOFA & race group: define a function to extract data only that meet selected SOFA & ethnicity_white:
+#            1, sofa_low_inclusive <= SOFA <= sofa_high_inclusive
+#            2, ethnicity_white == ethnicity_white_value
+data_between_sofa_and_ethnicity_white <- function(
+    sofa_low_inclusive, sofa_high_inclusive,
+    ethnicity_white_value) {
+  res <- sepsis_data[sepsis_data$SOFA <= sofa_high_inclusive & sepsis_data$SOFA >= sofa_low_inclusive & sepsis_data$ethnicity_white == ethnicity_white_value, c("anchor_age","gender","anchor_year_group","SOFA","charlson_comorbidity_index", "ventilation_bin", "death_bin", "rrt", "pressor")]
+  return(na.omit(res))
+}
+```
+
+```{r}
+# Run TMLE function
+# by SOFA & race group
+require(arm)
+require(earth)
+require(ranger)
+require(rpart)
+require(xgboost)
+library(hal9001)
+library(haldensify)
+library(biglasso)
+# naming convertion here: run_tmle_(stratification)_(treatment). For Example:
+#        sofa_eth mean the data is sliced by sofa and eth, ventilation here is treatment
+run_tmle_sofa_eth_ventilation <- function(sofa_low_inclusive, sofa_high_inclusive, ethnicity_white_value) {
+  # TMLE 
+  print(paste0('Ventilation effect for SOFA between [', sofa_low_inclusive, ",", sofa_high_inclusive,"] with ethnicity_white = ", ethnicity_white_value))
+  data_sofa = data_between_sofa_and_ethnicity_white(sofa_low_inclusive, sofa_high_inclusive, ethnicity_white_value)
+  W <- data_sofa[, c("anchor_age","gender","anchor_year_group","SOFA","charlson_comorbidity_index", "pressor", "rrt")]
+  A <- data_sofa$ventilation_bin
+  Y <- data_sofa$death_bin
+  result <- tmle(Y, A, W , family = "binomial", 
+                 g.SL.library = c("SL.glm", "SL.glmnet", "SL.bayesglm","SL.mean"),
+                 Q.SL.library = c("SL.glm", "SL.glmnet", "SL.stepAIC","SL.mean","SL.earth","SL.ranger","SL.gam",
+                  "SL.bayesglm","SL.glm.interaction", "SL.biglasso")
+                 )
+  data_result <- list("data" = data_sofa, "result" = result)
+  return(data_result)
+}
+
+run_tmle_sofa_eth_rrt <- function(sofa_low_inclusive, sofa_high_inclusive, ethnicity_white_value) {
+  # TMLE 
+  print(paste0('Ventilation effect for SOFA between [', sofa_low_inclusive, ",", sofa_high_inclusive,"] with ethnicity_white = ", ethnicity_white_value))
+  data_sofa = data_between_sofa_and_ethnicity_white(sofa_low_inclusive, sofa_high_inclusive, ethnicity_white_value)
+  W <- data_sofa[, c("anchor_age","gender","anchor_year_group","SOFA","charlson_comorbidity_index", "pressor", "ventilation_bin")]
+  A <- data_sofa$rrt
+  Y <- data_sofa$death_bin
+  result <- tmle(Y, A, W , family = "binomial", 
+                 g.SL.library = c("SL.glm", "SL.glmnet", "SL.bayesglm","SL.mean"),
+                 Q.SL.library = c("SL.glm", "SL.glmnet", "SL.stepAIC","SL.mean","SL.earth","SL.ranger","SL.gam",
+                  "SL.bayesglm","SL.glm.interaction", "SL.biglasso")
+                 )
+  data_result <- list("data" = data_sofa, "result" = result)
+  return(data_result)
+}
+
+
+run_tmle_sofa_eth_pressor <- function(sofa_low_inclusive, sofa_high_inclusive, ethnicity_white_value) {
+  # TMLE 
+  print(paste0('Ventilation effect for SOFA between [', sofa_low_inclusive, ",", sofa_high_inclusive,"] with ethnicity_white = ", ethnicity_white_value))
+  data_sofa = data_between_sofa_and_ethnicity_white(sofa_low_inclusive, sofa_high_inclusive, ethnicity_white_value)
+  W <- data_sofa[, c("anchor_age","gender","anchor_year_group","SOFA","charlson_comorbidity_index", "rrt", "ventilation_bin")]
+  A <- data_sofa$pressor
+  Y <- data_sofa$death_bin
+  result <- tmle(Y, A, W , family = "binomial", 
+                 g.SL.library = c("SL.glm", "SL.glmnet", "SL.bayesglm","SL.mean"),
+                 Q.SL.library = c("SL.glm", "SL.glmnet", "SL.stepAIC","SL.mean","SL.earth","SL.ranger","SL.gam",
+                  "SL.bayesglm","SL.glm.interaction", "SL.biglasso")
+                 )
+  data_result <- list("data" = data_sofa, "result" = result)
+  return(data_result)
+}
+
+
+```
+
+
+
+```{r}
+# call TMLE function, mortality ~ ventilation 
+# by SOFA & race group, call TMLE function
+sofa_ranges <- list(list(0, 5), list(6,10), list(11, 15), list(16, 100))
+ethnicity_white_values <- list(0, 1)
+results <- list()
+print("------------ATE vs ventilation-----------")
+for (sofa in sofa_ranges) {
+    start <- sofa[1]
+    end <- sofa[2]
+    for(ethnicity_white_value in ethnicity_white_values) {
+      data_sofa_eth = data_between_sofa_and_ethnicity_white(start, end, ethnicity_white_value)
+      print(paste0("Working on sofa: [", start, ",", end, "]; ethnicity_white: ", ethnicity_white_value, " total count:", nrow(data_sofa_eth)))
+      input = paste0("Sofa: [", start, ",", end, "]; ethnicity_white: ", ethnicity_white_value, " total count:", nrow(data_sofa_eth))
+      result = run_tmle_sofa_eth_ventilation(start, end, ethnicity_white_value)
+      print(paste0(
+        paste0("Sofa: [", start, ",", end, "]; ethnicity_white: ", ethnicity_white_value, ":  ")
+        ,result$result$estimates$ATE[c("psi", "CI")]))
+      results <- append(results, input)
+      results <- append(results, result)
+    }
+}
+```
+
+```{r}
+# Graphic output
+require(ggplot2)
+sofaIndex <- 1
+sofa_ranges <- c(c(0, 5), c(6,10), c(11, 15), c(16, 100))
+while (sofaIndex <= 4) {
+  aygIndex <- 1
+  F <- runif(2,1,2) 
+  L <- runif(2,0,1)
+  U <- runif(2,2,3)
+
+  while (aygIndex <= 2) {
+    infoIndex <- (sofaIndex - 1) * 6 +  (aygIndex - 1) * 3 + 1
+    dataIndex <- infoIndex + 1
+    resultIndex <- infoIndex + 2
+    ciLow <- results[resultIndex]$result$estimates$ATE$CI[1]
+    ciHigh <- results[resultIndex]$result$estimates$ATE$CI[2]
+    psi <- results[resultIndex]$result$estimates$ATE$psi[1]
+    print(F)
+    print(aygIndex)
+    print(psi)
+    
+    F[aygIndex] = psi
+    L[aygIndex] = ciLow
+    U[aygIndex] = ciHigh
+    aygIndex <- aygIndex + 1
+  }
+  title <- paste0("Sofa:[",sofa_ranges[sofaIndex * 2 - 1], ",", sofa_ranges[sofaIndex * 2],"]")
+  df <- data.frame(x = c("non-white", "white"), F = F, L = L, U = U)
+  p <- ggplot(df, aes(x = x, y = F)) + geom_point(size = 2) + geom_errorbar(aes(ymax = U, ymin = L)) + labs(title=title) + labs(x = "ethnicity", y = "ATE") + geom_hline(aes(yintercept = 0, color="red"))
+  show(p)
+  sofaIndex <- sofaIndex + 1
+}
+```
+
+```{r}
+# call TMLE function, mortality ~ RRT 
+# by SOFA & race group, call TMLE function
+print("------------ATE vs rrt-----------")
+sofa_ranges <- list(list(0, 5), list(6,10), list(11, 15), list(16, 100))
+ethnicity_white_values <- list(0, 1)
+results <- list()
+for (sofa in sofa_ranges) {
+    start <- sofa[1]
+    end <- sofa[2]
+    for(ethnicity_white_value in ethnicity_white_values) {
+      data_sofa_eth = data_between_sofa_and_ethnicity_white(start, end, ethnicity_white_value)
+      print(paste0("Working on sofa: [", start, ",", end, "]; ethnicity_white: ", ethnicity_white_value, " total count:", nrow(data_sofa_eth)))
+      input = paste0("Sofa: [", start, ",", end, "]; ethnicity_white: ", ethnicity_white_value, " total count:", nrow(data_sofa_eth))
+      result = run_tmle_sofa_eth_rrt(start, end, ethnicity_white_value)
+      print(paste0(
+        paste0("Sofa: [", start, ",", end, "]; ethnicity_white: ", ethnicity_white_value, ":  ")
+        ,result$result$estimates$ATE[c("psi", "CI")]))
+      results <- append(results, input)
+      results <- append(results, result)
+    }
+}
+```
+
+```{r}
+
+# Graphic output
+require(ggplot2)
+sofaIndex <- 1
+sofa_ranges <- c(c(0, 5), c(6,10), c(11, 15), c(16, 100))
+while (sofaIndex <= 4) {
+  aygIndex <- 1
+  F <- runif(2,1,2) 
+  L <- runif(2,0,1)
+  U <- runif(2,2,3)
+
+  while (aygIndex <= 2) {
+    infoIndex <- (sofaIndex - 1) * 6 +  (aygIndex - 1) * 3 + 1
+    dataIndex <- infoIndex + 1
+    resultIndex <- infoIndex + 2
+    ciLow <- results[resultIndex]$result$estimates$ATE$CI[1]
+    ciHigh <- results[resultIndex]$result$estimates$ATE$CI[2]
+    psi <- results[resultIndex]$result$estimates$ATE$psi[1]
+    
+    F[aygIndex] = psi
+    L[aygIndex] = ciLow
+    U[aygIndex] = ciHigh
+    aygIndex <- aygIndex + 1
+  }
+  title <- paste0("Sofa:[",sofa_ranges[sofaIndex * 2 - 1], ",", sofa_ranges[sofaIndex * 2],"]")
+  df <- data.frame(x = c("non-white", "white"), F = F, L = L, U = U)
+  p <- ggplot(df, aes(x = x, y = F)) + geom_point(size = 2) + geom_errorbar(aes(ymax = U, ymin = L)) + labs(title=title) + labs(x = "ethnicity", y = "ATE") + geom_hline(aes(yintercept = 0, color="red"))
+  show(p)
+  sofaIndex <- sofaIndex + 1
+}
+```
+
+```{r}
+# call TMLE function, mortality ~ pressor 
+# by SOFA & year group, call TMLE function
+print("------------ATE vs pressor-----------")
+sofa_ranges <- list(list(0, 5), list(6,10), list(11, 15), list(16, 100))
+ethnicity_white_values <- list(0, 1)
+results <- list()
+for (sofa in sofa_ranges) {
+    start <- sofa[1]
+    end <- sofa[2]
+    for(ethnicity_white_value in ethnicity_white_values) {
+      data_sofa_eth = data_between_sofa_and_ethnicity_white(start, end, ethnicity_white_value)
+      print(paste0("Working on sofa: [", start, ",", end, "]; ethnicity_white: ", ethnicity_white_value, " total count:", nrow(data_sofa_eth)))
+      input = paste0("Sofa: [", start, ",", end, "]; ethnicity_white: ", ethnicity_white_value, " total count:", nrow(data_sofa_eth))
+      result = run_tmle_sofa_eth_pressor(start, end, ethnicity_white_value)
+      print(paste0(
+        paste0("Sofa: [", start, ",", end, "]; ethnicity_white: ", ethnicity_white_value, ":  ")
+        ,result$result$estimates$ATE[c("psi", "CI")]))
+      results <- append(results, input)
+      results <- append(results, result)
+    }
+}
+```
+
+
+```{r}
+# Graphic output
+require(ggplot2)
+sofaIndex <- 1
+sofa_ranges <- c(c(0, 5), c(6,10), c(11, 15), c(16, 100))
+while (sofaIndex <= 4) {
+  aygIndex <- 1
+  F <- runif(2,1,2) 
+  L <- runif(2,0,1)
+  U <- runif(2,2,3)
+
+  while (aygIndex <= 2) {
+    infoIndex <- (sofaIndex - 1) * 6 +  (aygIndex - 1) * 3 + 1
+    dataIndex <- infoIndex + 1
+    resultIndex <- infoIndex + 2
+    ciLow <- results[resultIndex]$result$estimates$ATE$CI[1]
+    ciHigh <- results[resultIndex]$result$estimates$ATE$CI[2]
+    psi <- results[resultIndex]$result$estimates$ATE$psi[1]
+    
+    F[aygIndex] = psi
+    L[aygIndex] = ciLow
+    U[aygIndex] = ciHigh
+    aygIndex <- aygIndex + 1
+  }
+  title <- paste0("Sofa:[",sofa_ranges[sofaIndex * 2 - 1], ",", sofa_ranges[sofaIndex * 2],"]")
+  df <- data.frame(x = c("non-white", "white"), F = F, L = L, U = U)
+  p <- ggplot(df, aes(x = x, y = F)) + geom_point(size = 2) + geom_errorbar(aes(ymax = U, ymin = L)) + labs(title=title) + labs(x = "ethnicity", y = "ATE") + geom_hline(aes(yintercept = 0, color="red"))
+  show(p)
+  sofaIndex <- sofaIndex + 1
+}
+```

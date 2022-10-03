@@ -1,0 +1,211 @@
+---
+title: "ltmle-sepsis"
+author: "yirencao"
+date: '2022-08-07'
+output: html_document
+---
+
+```{R}
+require(dplyr) # needed to use %>% mutate function below
+library(ltmle)
+```
+
+# setup data
+
+```{r}
+# prepare data
+
+require(dplyr)
+library("tmle")
+library("psych")
+
+load_data <- function(){
+raw_data <- read.csv("/Volumes/Disk199G/mph/Team-Sepsis/Raw Data.csv", header=TRUE, stringsAsFactors=TRUE)
+sepsis_data <- raw_data %>%
+      mutate(gender = ifelse(gender == "F",1,0))
+ventilation_bin <- raw_data[, c(1)] # just copy any column and will put them into the raw_data, and will modify it as necessary below
+death_bin <- raw_data[, c(1)]
+ethnicity_white <- raw_data[, c(1)]
+sepsis_data <- cbind(sepsis_data, ventilation_bin, death_bin, ethnicity_white)
+sepsis_data <- sepsis_data %>% mutate(ventilation_bin = ifelse(InvasiveVent_hr > 0 & !is.na(InvasiveVent_hr), 1, 0))
+sepsis_data <- sepsis_data %>% mutate(death_bin = ifelse(discharge_location == "DIED" | discharge_location == "HOSPICE" , 
+                                                         1, 
+                                                         ifelse(discharge_location == "", NaN, 0)))
+sepsis_data <- sepsis_data %>% mutate(ethnicity_white = ifelse(ethnicity == "WHITE", 1, 0))
+
+sepsis_data <- sepsis_data %>% mutate(charlson_comorbidity_index = ifelse(
+  charlson_comorbidity_index >= 0 & charlson_comorbidity_index <= 5, "0 - 5",
+  ifelse(
+  charlson_comorbidity_index >= 6 & charlson_comorbidity_index <= 10, "6 - 10",
+  ifelse(
+  charlson_comorbidity_index >= 11 & charlson_comorbidity_index <= 15, "11 - 15",
+  "16 and above")
+  )
+))
+
+# in raw_data, pressor is either True or "", map it to 1 or 0 
+sepsis_data <- sepsis_data %>% mutate(pressor = ifelse(pressor == levels(raw_data$pressor)[2], 1, 0))
+
+sepsis_data <- sepsis_data %>% mutate(rrt = ifelse(is.na(rrt), 0, 1))
+return(sepsis_data)
+}
+```
+
+```{r}
+data_between_sofa <- function(
+    sepsis_data, sofa_low_inclusive, sofa_high_inclusive) {
+  res <- sepsis_data[sepsis_data$SOFA <= sofa_high_inclusive & sepsis_data$SOFA >= sofa_low_inclusive , c("anchor_age","gender","ethnicity_white","SOFA","charlson_comorbidity_index", "ventilation_bin", "death_bin", "rrt", "pressor", "anchor_year_group")]
+  return(na.omit(res))
+}
+
+```
+
+```{r}
+rebuild_data <- function(
+    sepsis_data) {
+# rebuild sepsis_data
+sepsis_data_new <- sepsis_data[, c("ethnicity_white", "ventilation_bin")]
+sepsis_data_new$gender1 <- sepsis_data[, c("gender")]
+sepsis_data_new$anchor_age1 <- sepsis_data[, c("anchor_age")]
+sepsis_data_new$charlson_comorbidity_index1 <- sepsis_data[, c("charlson_comorbidity_index")]
+sepsis_data_new$SOFA1 <- sepsis_data[, c("SOFA")]
+sepsis_data_new$pressor1 <- sepsis_data[, c("pressor")]
+sepsis_data_new$rrt1 <- sepsis_data[, c("rrt")]
+sepsis_data_new$anchor_year_group1  <- sepsis_data[, c("anchor_year_group")]
+
+sepsis_data_new$gender2 <- sepsis_data[, c("gender")]
+sepsis_data_new$anchor_age2 <- sepsis_data[, c("anchor_age")]
+sepsis_data_new$charlson_comorbidity_index2 <- sepsis_data[, c("charlson_comorbidity_index")]
+sepsis_data_new$SOFA2 <- sepsis_data[, c("SOFA")]
+sepsis_data_new$pressor2 <- sepsis_data[, c("pressor")]
+sepsis_data_new$rrt2 <- sepsis_data[, c("rrt")]
+sepsis_data_new$anchor_year_group2  <- sepsis_data[, c("anchor_year_group")]
+
+sepsis_data_new$death_bin <- sepsis_data[,c('death_bin')]
+
+return(na.omit(sepsis_data_new))
+}
+```
+
+```{r}
+sepsis_data <- load_data()
+```
+
+
+```{r}
+# Run LTMLE by ventilation + race (2x2)
+
+require(arm)
+require(earth)
+require(ranger)
+require(rpart)
+require(xgboost)
+library(hal9001)
+library(haldensify)
+library(biglasso)
+
+
+l1 <- c("gender1", "anchor_age1", "charlson_comorbidity_index1", "SOFA1", "pressor1", "rrt1", "anchor_year_group1")
+l2 <- c("gender2", "anchor_age2", "charlson_comorbidity_index2", "SOFA2", "pressor2", "rrt2", "anchor_year_group2")
+Lnodes <- c(l1, l2)
+
+
+abar1 <- c(0,0)
+abar2 <- c(0,1)
+abar3 <- c(1,0)
+abar4 <- c(1,1)
+
+# n = dim(sepsis_data)[1]
+# abar <- matrix(rep(abar4, n), nrow=n, ncol=2, byrow=TRUE)
+
+run_ltmle_abar_w_slLib <- function(sepsis_data, abar){
+result <- ltmle(data = sepsis_data, 
+      Anodes = c("ethnicity_white", "ventilation_bin"), 
+      Lnodes = Lnodes, 
+      Ynodes = c("death_bin"), 
+      abar = abar, 
+      gbounds = c(0.01, 1),
+      Qform=NULL,
+      gform=NULL,
+      SL.library = c("SL.glm", "SL.glmnet", "SL.stepAIC","SL.mean","SL.earth","SL.ranger","SL.gam","SL.bayesglm","SL.glm.interaction", "SL.biglasso")
+      )
+return(result)
+}
+
+run_ltmle_abar <- function(sepsis_data, abar){
+  suppressWarnings(ltmle, classes = "warning")
+result <- ltmle(data = sepsis_data, 
+      Anodes = c("ethnicity_white", "ventilation_bin"), 
+      Lnodes = Lnodes, 
+      Ynodes = c("death_bin"), 
+      abar = abar, 
+      gbounds = c(0.01, 1),
+      Qform=NULL,
+      gform=NULL
+      )
+return(result)
+}
+```
+
+
+
+```{r}
+# cut data by SOFA score and run ltmle by 2x2 WITHOUT SL library
+sofa_ranges <- list(list(0, 5), list(6,10), list(11, 15), list(16, 100))
+results_by_sofa <- list()
+for (sofa in sofa_ranges) {
+    start <- sofa[1]
+    end <- sofa[2]
+    data_sofa = rebuild_data(data_between_sofa(sepsis_data, start, end))
+    input = paste0("LTMLE: sofa: [", start, ",", end, "]; Total count:", nrow(data_sofa))
+    print(input)
+    print("abar = 00")
+    result_run_ltmle_abar_00 <- run_ltmle_abar(data_sofa, c(0,0))
+    print(summary(result_run_ltmle_abar_00))
+    
+    print("abar = 01")
+    result_run_ltmle_abar_01 <- run_ltmle_abar(data_sofa, c(0,1))
+    print(summary(result_run_ltmle_abar_01))
+    
+    print("abar = 10")
+    result_run_ltmle_abar_10 <- run_ltmle_abar(data_sofa, c(1,0))
+    print(summary(result_run_ltmle_abar_10))
+    
+    print("abar = 11")
+    result_run_ltmle_abar_11 <- run_ltmle_abar(data_sofa, c(1,1))
+    print(summary(result_run_ltmle_abar_11))
+}
+```
+
+```{r}
+# cut data by SOFA score and run ltmle by 2x2 WITH SL library
+sofa_ranges <- list(list(0, 5), list(6,10), list(11, 15), list(16, 100))
+results_by_sofa <- list()
+for (sofa in sofa_ranges) {
+    start <- sofa[1]
+    end <- sofa[2]
+    data_sofa = rebuild_data(data_between_sofa(sepsis_data, start, end))
+    input = paste0("LTMLE: sofa: [", start, ",", end, "]; Total count:", nrow(data_sofa))
+    print(input)
+    print("abar = 00")
+    result_run_ltmle_abar_00_wlib <- run_ltmle_abar_w_slLib(data_sofa, c(0,0))
+    print(summary(result_run_ltmle_abar_00_wlib))
+    
+    print("abar = 01")
+    result_run_ltmle_abar_01_wlib <- run_ltmle_abar_w_slLib(data_sofa, c(0,1))
+    print(summary(result_run_ltmle_abar_01_wlib))
+    
+    print("abar = 10")
+    result_run_ltmle_abar_10_wlib <- run_ltmle_abar_w_slLib(data_sofa, c(1,0))
+    print(summary(result_run_ltmle_abar_10_wlib))
+    
+    print("abar = 11")
+    result_run_ltmle_abar_11_wlib <- run_ltmle_abar_w_slLib(data_sofa, c(1,1))
+    print(summary(result_run_ltmle_abar_11_wlib))
+}
+```
+
+
+
+
+
